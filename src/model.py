@@ -44,6 +44,16 @@ class WavLMSegmentation(Model):
         self.classifier = nn.Linear(self.lstm_out_dim, num_classes)
         self.activation = self.default_activation()
 
+    def num_frames(self, num_samples: int) -> int:
+            import torch
+
+            # 'self.wavlm' must match the variable name of your WavLMModel in __init__
+            # We pass the input length to the HF helper method to get the EXACT output length
+            with torch.no_grad():
+                output_lengths = self.wavlm._get_feat_extract_output_lengths(torch.tensor([num_samples]))
+
+            return output_lengths.item()
+            
     def forward(self, waveforms: torch.Tensor, weights: torch.Tensor = None):
         # 1. WavLM Expects (Batch, Time), but we might have (Batch, 1, Time)
         if waveforms.dim() == 3:
