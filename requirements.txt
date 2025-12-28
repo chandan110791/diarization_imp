@@ -1,0 +1,9 @@
+torch==2.3.1
+torchaudio==2.3.1
+pyannote.audio==3.3.1
+pyannote.metrics==3.2.1
+pyannote.core==5.0.0
+numpy<2.0
+torch-geometric
+optuna
+pandas

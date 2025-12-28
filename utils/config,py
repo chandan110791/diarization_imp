@@ -1,0 +1,15 @@
+# In your local VS Code setup (src/config.py)
+import os
+from pathlib import Path
+
+# Detect if we are in Colab or Local
+if os.path.exists("/content/drive"):
+    # Colab Paths
+    CHECKPOINT_DIR = Path("/content/drive/MyDrive/Research_Proposal_Papers/Pyannnote_Objective_1++/checkpoints")
+    RESULTS_DIR = Path("/content/drive/MyDrive/Research_Proposal_Papers/Pyannnote_Objective_1++/results")
+else:
+    # Local Paths (WSL)
+    CHECKPOINT_DIR = Path("./checkpoints")
+    RESULTS_DIR = Path("./results")
+
+# Now your training script always saves to the safe place automatically!
