@@ -1,0 +1,18 @@
+
+Databases:
+  AMI:
+    - /mnt/c/Users/bobby/Desktop/Proposals/Diari++/gitCode/Diar_Imp/data/ami_mini/audio/{uri}.wav
+
+Protocols:
+  AMI:
+    SpeakerDiarization:
+      mini:
+        train:
+          uri: /mnt/c/Users/bobby/Desktop/Proposals/Diari++/gitCode/Diar_Imp/data/ami_mini/lists/train.txt
+          annotation: /mnt/c/Users/bobby/Desktop/Proposals/Diari++/gitCode/Diar_Imp/data/ami_mini/annotations/{uri}.rttm
+        development:
+          uri: /mnt/c/Users/bobby/Desktop/Proposals/Diari++/gitCode/Diar_Imp/data/ami_mini/lists/dev.txt
+          annotation: /mnt/c/Users/bobby/Desktop/Proposals/Diari++/gitCode/Diar_Imp/data/ami_mini/annotations/{uri}.rttm
+        test:
+          uri: /mnt/c/Users/bobby/Desktop/Proposals/Diari++/gitCode/Diar_Imp/data/ami_mini/lists/test.txt
+          annotation: /mnt/c/Users/bobby/Desktop/Proposals/Diari++/gitCode/Diar_Imp/data/ami_mini/annotations/{uri}.rttm
