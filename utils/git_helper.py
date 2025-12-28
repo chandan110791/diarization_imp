@@ -10,8 +10,8 @@ def push_changes(message="Update from Colab"):
     
     try:
         # 1. Configure Identity
-        subprocess.run(["git", "config", "--global", "user.email", "colab_runner@google.com"], check=True)
-        subprocess.run(["git", "config", "--global", "user.name", "Colab Runner"], check=True)
+        subprocess.run(["git", "config", "--global", "user.email", "chandan.kr.singh.11@gmail.com"], check=True)
+        subprocess.run(["git", "config", "--global", "user.name", "chandan110791"], check=True)
         
         # 2. Add All Changes
         # We capture output to avoid spamming logs unless there's an error
