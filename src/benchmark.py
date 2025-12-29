@@ -1,185 +1,314 @@
-import torch
+# benchmark.py
+from __future__ import annotations
+
 import os
-import ast
-import json
-from pathlib import Path
-from tqdm import tqdm
-from pyannote.audio import Pipeline
-from pyannote.audio.pipelines import SpeakerDiarization
+import argparse
+import torch
+from pyannote.audio import Audio
+
+from pyannote.database import get_protocol, FileFinder
 from pyannote.metrics.diarization import DiarizationErrorRate
-from pyannote.database import registry, FileFinder
-from pyannote.core import Segment, Timeline
-import re 
+from pyannote.audio import Model, Pipeline
+from pyannote.audio.pipelines import SpeakerDiarization
 
-# Import custom modules
-from src.model import WavLMSegmentation
-from src.dataset import setup_data
-
-# --- CONFIGURATION ---
-CHECKPOINT_DIR = Path("checkpoints")
-# Use your Hugging Face Token from environment or hardcode it if necessary
-AUTH_TOKEN = os.environ.get("hf_token") 
+from train import PyannoteWavLMEmbeddingAdapter  # your train.py
 
 
-def get_best_checkpoint():
-    print("🔍 Scanning for checkpoints...")
-    if not CHECKPOINT_DIR.exists():
-        raise FileNotFoundError("❌ No checkpoints found! Did you run training?")
-    
-    # Get all .ckpt files
-    all_files = list(CHECKPOINT_DIR.glob("*.ckpt"))
-    if not all_files:
-        raise FileNotFoundError("❌ Checkpoint folder exists but is empty.")
+SEGMENTATION_MODEL_ID = "pyannote/segmentation-3.0"
+BASELINE_PIPELINE_ID = "pyannote/speaker-diarization-3.1"
 
-    # 1. Parse all files
-    valid_checkpoints = []
-    print(f"   Found {len(all_files)} files:")
-    
-    for path in all_files:
-        # Regex to safely find numbers. 
-        # Matches "val_loss=" followed by digits/dots, stopping before ".ckpt"
-        loss_match = re.search(r"val_loss=([0-9\.]+)", path.name)
-        epoch_match = re.search(r"epoch=([0-9]+)", path.name)
-        
-        if loss_match and epoch_match:
-            try:
-                # Strip trailing dot if regex grabbed it (e.g. "0.00." -> "0.00")
-                loss_str = loss_match.group(1).rstrip(".") 
-                loss = float(loss_str)
-                epoch = int(epoch_match.group(1))
-                valid_checkpoints.append({'path': path, 'loss': loss, 'epoch': epoch})
-                print(f"    • {path.name} -> Loss: {loss}, Epoch: {epoch}")
-            except ValueError:
-                print(f"    ⚠️ Skipping {path.name} (Parse Error)")
+# Your intended params (we will apply only those supported by your pipeline version)
+DESIRED_PARAMS = {
+    "segmentation": {"threshold": 0.444, "min_duration_off": 0.0},
+    "clustering": {"method": "centroid", "min_cluster_size": 15, "threshold": 0.715},
+}
 
-    if not valid_checkpoints:
-        print("⚠️ No valid 'val_loss' filenames found. Using newest file.")
-        return max(all_files, key=os.path.getmtime)
+import random, torch
+import torch.nn.functional as F
+from pyannote.audio import Audio
 
-    # 2. Sort: Primary = Lowest Loss, Secondary = Highest Epoch
-    # We sort by tuple (loss, -epoch) because Python sorts tuples element-wise
-    best_ckpt_data = min(valid_checkpoints, key=lambda x: (x['loss'], -x['epoch']))
-    
-    print(f"\n🏆 WINNER: {best_ckpt_data['path'].name}")
-    print(f"   (Loss: {best_ckpt_data['loss']:.4f}, Epoch: {best_ckpt_data['epoch']})")
-    
-    return best_ckpt_data['path']
+def probe_across_files(embedding_model, file_dicts, device, num_files=4, num_chunks_per_file=4, chunk_sec=5.0):
+    audio = Audio(sample_rate=16000, mono=True)
+    chosen = random.sample(file_dicts, k=min(num_files, len(file_dicts)))
+
+    embs = []
+    tags = []
+    for f in chosen:
+        waveform, sr = audio(f["audio"])
+        T = waveform.shape[1]
+        L = int(chunk_sec * sr)
+        if T < L:
+            continue
+        for _ in range(num_chunks_per_file):
+            s = random.randint(0, T - L)
+            chunk = waveform[:, s:s+L]
+            embs.append(chunk)
+            tags.append(f["uri"])
+
+    batch = torch.stack(embs, dim=0).to(device)  # (B,1,L)
+    with torch.no_grad():
+        E = F.normalize(embedding_model(batch), p=2, dim=1)
+
+    # cosine matrix
+    C = E @ E.T
+
+    # compute same-uri vs different-uri cosine stats
+    same = []
+    diff = []
+    for i in range(len(tags)):
+        for j in range(i+1, len(tags)):
+            (same if tags[i] == tags[j] else diff).append(C[i, j].item())
+
+    print("\n[CHECK2++] Across-files cosine stats")
+    print(" same-uri  : mean", sum(same)/len(same), "min", min(same), "max", max(same))
+    print(" diff-uri  : mean", sum(diff)/len(diff), "min", min(diff), "max", max(diff))
 
 
-def get_best_params():
-    """Loads parameters from the Tuning phase, or uses defaults."""
+import random
+import torch.nn.functional as F
+
+def probe_embedding_distribution(embedding_model, audio_path: str, device, num_chunks=12, chunk_sec=5.0):
+    """
+    Proper CHECK2: sample multiple chunks -> embeddings -> check diversity.
+    If embeddings collapse, cosine similarities will be ~1.0 everywhere.
+    """
+    from pyannote.audio import Audio
+    audio = Audio(sample_rate=16000, mono=True)
+    waveform, sr = audio(audio_path)             # (1, T)
+    T = waveform.shape[1]
+    L = int(chunk_sec * sr)
+
+    if T < L:
+        raise RuntimeError(f"Audio too short for {chunk_sec}s probe: {audio_path}")
+
+    # sample random start positions
+    starts = [random.randint(0, T - L) for _ in range(num_chunks)]
+    chunks = [waveform[:, s:s+L] for s in starts]   # list of (1, L)
+
+    batch = torch.stack(chunks, dim=0).to(device)   # (B, 1, L)
+    with torch.no_grad():
+        emb = embedding_model(batch)                # (B, D)
+        emb = F.normalize(emb, p=2, dim=1)
+
+    # cosine similarity matrix (B x B)
+    cos = emb @ emb.T
+    offdiag = cos[~torch.eye(cos.size(0), dtype=torch.bool, device=cos.device)]
+
+    print("\n[CHECK2+] Multi-chunk cosine similarity stats:")
+    print("  cos mean:", offdiag.mean().item())
+    print("  cos min :", offdiag.min().item())
+    print("  cos max :", offdiag.max().item())
+    print("  emb std (mean over dims):", emb.std(dim=0, unbiased=False).mean().item())
+
+def make_embedding_spec(
+    backend: str,
+    device: torch.device,
+    hf_token: str,
+    wavlm_model: str = "microsoft/wavlm-base-plus",
+    proj_dim: int = 256,
+    wavlm_duration: float = 5.0,
+):
+    """
+    pyannote.audio 3.x expects embedding= to be str/dict OR a pyannote.audio Model.
+    """
+    if backend == "ecapa":
+        base = Pipeline.from_pretrained(BASELINE_PIPELINE_ID, use_auth_token=hf_token)
+        base.to(device)
+        return base.embedding
+
+    if backend == "wavlm":
+        m = PyannoteWavLMEmbeddingAdapter(
+            model_name=wavlm_model,
+            target_dim=proj_dim,
+            duration=wavlm_duration,
+            freeze_backbone=False,
+        )
+        m.to(device).eval()
+        return m
+
+    raise ValueError("backend must be one of: ecapa, wavlm")
+
+
+def _subpipeline_leaf_keys(pipe: SpeakerDiarization, name: str) -> set[str]:
+    sub = getattr(pipe, "_pipelines", {}).get(name, None)
+    if sub is None:
+        return set()
     try:
-        with open("best_params.txt", "r") as f:
-            params = ast.literal_eval(f.read())
-        print(f"⚙️  Loaded Tuned Params: {params}")
-        return params
-    except:
-        print("⚠️  No tuning file found. Using Defaults (Expect lower performance).")
-        return {"onset": 0.5, "offset": 0.5, "min_duration_on": 0.0, "min_duration_off": 0.0}
+        return set(sub.parameters().keys())
+    except Exception:
+        return set()
 
-def run_benchmark():
-    print("🚀 INITIALIZING FINAL BENCHMARK...")
-    
-    # 1. Setup Data
-    setup_data(force=False)
-    registry.load_database("database.yml")
-    
-    # Preprocessors to fix UEM/Timeline issues
-    def get_annotated(file):
-        import torchaudio
-        info = torchaudio.info(file["audio"])
-        duration = info.num_frames / info.sample_rate
-        return Timeline([Segment(0, duration)])
 
-    preprocessors = {
-        "audio": FileFinder(),
-        "annotated": get_annotated
-    }
-    
-    protocol = registry.get_protocol("AMI.SpeakerDiarization.mini", preprocessors=preprocessors)
-    test_files = list(protocol.test())
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"⚙️  Running on {device}")
+def _filter_params_for_subpipeline(desired: dict, allowed_leaf: set[str]) -> dict:
+    return {k: v for k, v in desired.items() if k in allowed_leaf}
 
-    # 2. Load Models
-    print("⏳ Loading Pyannote Baseline...")
-    pipeline_baseline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=AUTH_TOKEN
-    ).to(device)
 
-    print("⏳ Building Your WavLM Pipeline...")
-    ckpt_path = get_best_checkpoint()
-    print(f"   • Checkpoint: {ckpt_path.name}")
-    
-    custom_model = WavLMSegmentation.load_from_checkpoint(ckpt_path)
-    custom_model.to(device)
-    custom_model.eval()
+def build_pipeline(device: torch.device, hf_token: str, embedding_spec):
+    seg = Model.from_pretrained(SEGMENTATION_MODEL_ID, use_auth_token=hf_token).to(device)
 
-    # Reconstruct pipeline using Baseline's clustering (Fair Comparison)
-    pipeline_custom = SpeakerDiarization(
-        segmentation=custom_model,
-        embedding=pipeline_baseline.embedding,
+    pipe = SpeakerDiarization(
+        segmentation=seg,
+        embedding=embedding_spec,
         embedding_exclude_overlap=True,
         clustering="AgglomerativeClustering",
     )
-    pipeline_custom.to(device)
+    pipe.to(device)
 
-    # 3. Apply Tuned Parameters
-    best_params = get_best_params()
-    
-    # Map Optuna 'onset/offset' to the pipeline config structure
-    pipeline_config = {
-        "segmentation": {
-            "min_duration_off": best_params.get("min_duration_off", 0.0),
-            "threshold": best_params.get("onset", 0.5), # 'onset' acts as the main threshold here
-        },
-        "clustering": {
-            "method": "centroid",
-            "min_cluster_size": 12,
-            "threshold": 0.707,
-        }
-    }
-    pipeline_custom.instantiate(pipeline_config)
+    print("[DEBUG] segmentation pipeline object:", pipe._pipelines["segmentation"])
+    print("[DEBUG] segmentation leaf params:", pipe._pipelines["segmentation"].parameters())
 
-    # 4. Run Comparison
-    print(f"\n⚔️  Benchmarking {len(test_files)} files...")
-    metric_base = DiarizationErrorRate()
-    metric_custom = DiarizationErrorRate()
+    # Filter params according to what your installed version exposes
+    seg_keys = _subpipeline_leaf_keys(pipe, "segmentation")
+    clu_keys = _subpipeline_leaf_keys(pipe, "clustering")
 
-    for file in tqdm(test_files):
-        # Baseline
-        try:
-            hyp_base = pipeline_baseline(file)
-            metric_base(file["annotation"], hyp_base, uem=file["annotated"])
-        except Exception as e:
-            print(f"   ⚠️ Baseline Failed on {file['uri']}: {e}")
+    print("\n[DEBUG] segmentation leaf params:", sorted(seg_keys) if seg_keys else "(none)")
+    print("[DEBUG] clustering leaf params:", sorted(clu_keys) if clu_keys else "(none)")
 
-        # Custom
-        try:
-            hyp_custom = pipeline_custom(file)
-            metric_custom(file["annotation"], hyp_custom, uem=file["annotated"])
-        except Exception as e:
-            print(f"   ⚠️ Custom Failed on {file['uri']}: {e}")
+    seg_params = _filter_params_for_subpipeline(DESIRED_PARAMS.get("segmentation", {}), seg_keys)
+    clu_params = _filter_params_for_subpipeline(DESIRED_PARAMS.get("clustering", {}), clu_keys)
 
-    # 5. Report
-    der_base = abs(metric_base) * 100
-    der_custom = abs(metric_custom) * 100
-    
-    print("\n" + "="*40)
-    print("📊 FINAL RESULTS (Global DER)")
-    print("="*40)
-    print(f"🔵 Baseline (SOTA):  {der_base:.2f}%")
-    print(f"🟢 Your WavLM Model: {der_custom:.2f}%")
-    print("-" * 40)
-    
-    diff = der_base - der_custom
-    if diff > 0:
-        print(f"🏆 SUCCESS: You beat the baseline by {diff:.2f}%!")
-    else:
-        print(f"📉 GAP: You are behind by {abs(diff):.2f}%.")
-        print("   (Tip: Train for more epochs or tune 'min_duration_on' further)")
+    params_to_apply = {"segmentation": seg_params, "clustering": clu_params}
+    print("\n[DEBUG] Applying params:", params_to_apply)
+
+    # REQUIRED (your earlier error was because instantiate didn't happen)
+    pipe.instantiate(params_to_apply)
+    return pipe
+
+
+def run_der(pipe, protocol_name: str, database_yml: str, use_fp16: bool,
+            backend: str, embedding_spec=None, device=None, wavlm_duration: float = 5.0):
+    # Make sure we load the right YAML
+    os.environ["PYANNOTE_DATABASE_CONFIG"] = os.path.abspath(database_yml)
+
+    preprocessors = {"audio": FileFinder()}
+    protocol = get_protocol(protocol_name, preprocessors=preprocessors)
+
+    test_files = list(protocol.test())
+    if not test_files:
+        raise RuntimeError("Protocol test() returned 0 files. Check your lists/test.txt paths.")
+
+    # OPTIONAL: run across-file probe ONCE (before diarization loop)
+    if backend == "wavlm" and embedding_spec is not None and device is not None:
+        probe_across_files(embedding_spec, test_files, device=device, chunk_sec=wavlm_duration)
+
+    # ---- sanity check: confirm audio is present and resolvable ----
+    sample = test_files[0]
+    print("\n[DEBUG] Sample keys:", sorted(sample.keys()))
+    print("[DEBUG] Sample uri:", sample.get("uri", None))
+    print("[DEBUG] Sample audio:", sample.get("audio", None))
+
+    audio_path = sample.get("audio", None)
+    if audio_path is None:
+        raise RuntimeError("Missing 'audio' key. FileFinder didn't resolve paths. Check database.yml.")
+    if isinstance(audio_path, str) and audio_path.startswith("/") and not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Resolved audio path does not exist: {audio_path}")
+
+    metric = DiarizationErrorRate()
+
+    device2 = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    autocast = torch.cuda.amp.autocast if (use_fp16 and device2.type == "cuda") else None
+
+    for idx, f in enumerate(test_files):
+        if autocast:
+            with autocast():
+                hyp = pipe(f)
+        else:
+            hyp = pipe(f)
+
+        # UEM must be applied per file
+        uem = f.get("annotated", None)
+        if uem is None or len(uem) == 0:
+            raise RuntimeError(f"Bad or empty UEM for uri={f.get('uri')}.")
+
+        metric(f["annotation"], hyp, uem=uem)
+
+        # CHECK3 prints per file (force flush so you see it during long runs)
+        print(f"[CHECK3] {idx+1}/{len(test_files)} {f.get('uri')} predicted speakers: {len(hyp.labels())}", flush=True)
+
+    return abs(metric)
+
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--protocol", default="AMI.SpeakerDiarization.mini")
+    ap.add_argument("--database_yml", default="database.yml")
+    ap.add_argument("--backend", choices=["ecapa", "wavlm"], required=True)
+    ap.add_argument("--wavlm_model", default="microsoft/wavlm-base-plus")
+    ap.add_argument("--proj_dim", type=int, default=256)
+    ap.add_argument("--wavlm_duration", type=float, default=5.0)
+    ap.add_argument("--fp16", action="store_true")
+    args = ap.parse_args()
+
+    hf_token = os.environ.get("HF_TOKEN", None)
+    if not hf_token:
+        raise RuntimeError("HF_TOKEN is not set. Run: export HF_TOKEN=hf_...")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+
+    embedding_spec = make_embedding_spec(
+        backend=args.backend,
+        device=device,
+        hf_token=hf_token,
+        wavlm_model=args.wavlm_model,
+        proj_dim=args.proj_dim,
+        wavlm_duration=args.wavlm_duration,
+    )
+    print(f"Embedding backend={args.backend} -> type={type(embedding_spec)}")
+
+    pipe = build_pipeline(device=device, hf_token=hf_token, embedding_spec=embedding_spec)
+	
+
+    audio = Audio(sample_rate=16000, mono=True)
+
+    # pick one test file to probe embeddings
+    os.environ["PYANNOTE_DATABASE_CONFIG"] = os.path.abspath(args.database_yml)
+    protocol = get_protocol(args.protocol, preprocessors={"audio": FileFinder()})
+    probe = next(iter(protocol.test()))
+
+    waveform, sr = audio(probe["audio"])  # waveform: (1, T)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.backend == "wavlm":
+      probe_embedding_distribution(embedding_spec, probe["audio"], device=device, num_chunks=12, chunk_sec=args.wavlm_duration)
+
+
+    # take a 5s chunk (match wavlm_duration) if possible
+    chunk_len = int(5.0 * sr)
+    wave = waveform[:, :chunk_len] if waveform.shape[1] >= chunk_len else waveform
+
+    # make a batch: (B, C, T)
+    batch = wave.unsqueeze(0).to(device)
+
+    # Only for wavlm backend: check your embedding model directly
+    if args.backend == "wavlm":
+      emb = embedding_spec(batch)  # embedding_spec is your PyannoteWavLMEmbeddingAdapter
+      norms = emb.norm(dim=1)
+      print("\n[CHECK2] WavLM embedding norms:",
+          "mean=", norms.mean().item(),
+          "min=", norms.min().item(),
+          "max=", norms.max().item())
+      print("[CHECK2] Embedding variance (mean over dims):",
+          emb.var(dim=0, unbiased=False).mean().item())
+
+
+    der = run_der(
+          pipe,
+          args.protocol,
+          args.database_yml,
+          use_fp16=args.fp16,
+          backend=args.backend,
+          embedding_spec=embedding_spec,
+          device=device,
+          wavlm_duration=args.wavlm_duration)
+
+
+    print("=" * 70)
+    print(f"{args.backend} DER: {der:.2%}")
+    print("=" * 70)
+
 
 if __name__ == "__main__":
-    run_benchmark()
+    main()

@@ -1,105 +1,72 @@
+# train_embedding.py
+from __future__ import annotations
+
 import os
-import argparse
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
-import torchaudio
-import pytorch_lightning as pl
-from pathlib import Path
-from pyannote.audio.tasks import Segmentation
-from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar
-from pyannote.database import registry, FileFinder
-from pyannote.core import Segment, Timeline
+import torch.nn as nn
+from pyannote.audio.core.model import Model
+from pyannote.audio.core.task import Specifications, Problem, Resolution
 
-# Import your custom modules
-from dataset import setup_data
-from model import WavLMSegmentation
+from model import WavLMEmbedding
 
-# --- HELPER: The Fix for Validation Crashes ---
-def get_annotated(file):
+
+class PyannoteWavLMEmbeddingAdapter(Model):
     """
-    Generates a 'UEM' timeline on the fly.
-    Tells Pyannote to treat the ENTIRE file duration as valid for training/validation.
+    Wrap torch embedding model to be usable in pyannote SpeakerDiarization pipeline.
+
+    SpeakerDiarization expects embedding=Inference(window="sliding", duration=..., step=...)
+    where Inference wraps a pyannote.audio Model with:
+      specifications.problem = REPRESENTATION
+      specifications.resolution = CHUNK
+      specifications.duration = <chunk duration>
     """
-    if "torchaudio.info" in file:
-        info = file["torchaudio.info"]
-    else:
-        info = torchaudio.info(file["audio"])
-    
-    duration = info.num_frames / info.sample_rate
-    return Timeline([Segment(0, duration)])
+    def __init__(
+        self,
+        model_name: str = "microsoft/wavlm-base-plus",
+        target_dim: int = 256,
+        duration: float = 4.0,
+        freeze_backbone: bool = False,
+    ):
+        super().__init__(sample_rate=16000, num_channels=1)
 
-def train(max_epochs):
-    # 1. Setup Data
-    print("⚡️ Setting up Data...")
-    config_yaml = setup_data(force=False)
-    
-    with open("database.yml", "w") as f:
-        f.write(config_yaml)
-    
-    os.environ["PYANNOTE_DATABASE_CONFIG"] = str(Path("database.yml").absolute())
-    registry.load_database(str(Path("database.yml").absolute()))
-    
-    # 2. Load Protocol with PREPROCESSORS
-    # This prevents the "NoneType is not iterable" errors
-    preprocessors = {
-        "audio": FileFinder(),
-        "torchaudio.info": lambda f: torchaudio.info(f["audio"]),
-        "annotated": get_annotated
-    }
-    
-    protocol = registry.get_protocol("AMI.SpeakerDiarization.mini", preprocessors=preprocessors)
-    
-    # 3. Define the Task
-    print("📝 Configuring Segmentation Task...")
-    task = Segmentation(
-        protocol, 
-        duration=5.0, 
-        max_speakers_per_chunk=3, 
-        batch_size=16,
-        num_workers=4,
-        loss="bce" 
-    )
-    
-    # 4. Initialize Model
-    model = WavLMSegmentation()
-    model.task = task 
-    
-    # 5. Setup Trainer
-    # Checkpoints will be saved in 'checkpoints/'
-    checkpoint_dir = Path("checkpoints")
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
-    checkpoint_callback = ModelCheckpoint(
-        monitor="DiarizationErrorRate",
-        mode="min",
-        dirpath=checkpoint_dir,
-        filename="wavlm-{epoch:02d}-{val_loss:.2f}",
-        save_top_k=1,
-        save_last=True
-    )
-    
-    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    
-    print(f"🚀 Starting Training for {max_epochs} Epochs on {accelerator.upper()}...")
-    
-    trainer = pl.Trainer(
-        accelerator=accelerator,
-        devices=1,
-        max_epochs=max_epochs,
-        callbacks=[checkpoint_callback, RichProgressBar()],
-        default_root_dir=checkpoint_dir,
-        # Gradient clipping prevents the model from exploding if learning rate is too high
-        gradient_clip_val=0.5
-    )
-    
-    # 6. TRAIN!
-    trainer.fit(model)
-    
-    print(f"\n✅ Training Complete!")
-    print(f"🏆 Best Model: {checkpoint_callback.best_model_path}")
+        self.wavlm_model = WavLMEmbedding(
+            model_name=model_name,
+            target_dim=target_dim,
+            freeze_backbone=freeze_backbone,
+            output_hidden_states=True,
+        )
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=30, help="Number of epochs to train")
-    args = parser.parse_args()
-    
-    train(args.epochs)
+        self.specifications = Specifications(
+            problem=Problem.REPRESENTATION,
+            resolution=Resolution.CHUNK,
+            duration=duration,
+            classes=None,
+        )
+
+    def forward(self, waveforms: torch.Tensor, weights: torch.Tensor = None) -> torch.Tensor:
+        # waveforms expected: (B, C, T) or (B, T)
+        return self.wavlm_model(waveforms)
+
+
+# -------------------------
+# OPTIONAL: tiny training skeleton (if you want later)
+# -------------------------
+@dataclass
+class TrainConfig:
+    lr: float = 1e-4
+    freeze_backbone: bool = False
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def build_model(cfg: TrainConfig, duration: float = 4.0) -> PyannoteWavLMEmbeddingAdapter:
+    m = PyannoteWavLMEmbeddingAdapter(
+        model_name="microsoft/wavlm-base-plus",
+        target_dim=256,
+        duration=duration,
+        freeze_backbone=cfg.freeze_backbone,
+    )
+    m.to(torch.device(cfg.device))
+    return m
